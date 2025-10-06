@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: main-app
+  labels:
+    app: main-app
+spec:
+  # выбрал 3 реплики как компромисс - чтобы пережить сбой одной зоны и при этом не тратить лишние ресурсы ночью
+  replicas: 3
+  selector:
+    matchLabels:
+      app: main-app
+  template:
+    metadata:
+      labels:
+        app: main-app
+    spec:
+      # специально распределяю поды по зонам - у нас мультизональный кластер, хочу чтобы приложение пережило сбой целой зоны
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: main-app
+      # и по нодам тоже распределяю, но менее строго - если не получается равномерно, все равно запускаем
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: main-app
+      containers:
+      - name: main-app
+        image: our-app:latest
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            memory: "128Mi"  # по наблюдениям приложение стабильно потребляет 128M, поэтому такой запрос
+            cpu: "50m"       # даю небольшой запас на старт, хотя в работе хватает и меньше
+          limits:
+            memory: "256Mi"  # лимит с двойным запасом на случай неожиданных пиков
+            cpu: "500m"      # на первые запросы нужно много cpu, поэтому лимит повыше
+        # пробы настроил с учетом медленного старта приложения (5-10 секунд)
+        startupProbe:
+          httpGet:
+            path: /status
+            port: 8080
+          failureThreshold: 30  # даю до 150 секунд на старт с запасом, чтобы точно успело
+          periodSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /status
+            port: 8080
+          initialDelaySeconds: 10  # жду 10 секунд перед первой проверкой готовности
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /status
+            port: 8080
+          initialDelaySeconds: 30  # специально жду долго перед первой проверкой живости, чтобы не убить приложение во время инициализации
+          periodSeconds: 10
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: main-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: main-app
+  # минимум 2 реплики - чтобы сохранить работу если одна упадет, ночью этого хватит
+  minReplicas: 2
+  # максимум 6 - с запасом к известным 4 подам на пик, на случай неожиданного роста
+  maxReplicas: 6
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600  # настраиваю медленное уменьшение ночью - 10 минут окно, чтобы не масштабировался туда-сюда
+      policies:
+      - type: Percent
+        value: 50         # не более 50% подов за раз - плавно снижаем нагрузку
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60   # днем быстро реагируем на рост - всего 1 минута окно
+      policies:
+      - type: Percent
+        value: 100        # могу увеличить до 100% подов за раз - быстро реагируем на пик
+        periodSeconds: 15
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60  # целевая утилизация 60% - консервативно, чтобы оставался запас для всплесков
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: main-app-svc
+spec:
+  selector:
+    app: main-app
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP  # использую clusterip - предполагаю что доступ будет через ingress, не нужно наружу
